@@ -20,7 +20,6 @@ import (
 	"github.com/prometheus/prometheus/pkg/labels"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
-	"github.com/prometheus/prometheus/tsdb/tombstones"
 )
 
 // The errors exposed.
@@ -37,11 +36,15 @@ type Appendable interface {
 	Appender() Appender
 }
 
+type AllQueryable interface {
+	Queryable
+	ChunkQueryable
+}
+
 // Storage ingests and manages samples, along with various indexes. All methods
 // are goroutine-safe. Storage implements storage.SampleAppender.
-// TODO(bwplotka): Add ChunkQueryable to Storage in next PR.
 type Storage interface {
-	Queryable
+	AllQueryable
 	Appendable
 
 	// StartTime returns the oldest timestamp stored in the storage.
@@ -72,7 +75,7 @@ type Querier interface {
 // Use it when you need to have access to samples in encoded format.
 type ChunkQueryable interface {
 	// ChunkQuerier returns a new ChunkQuerier on the storage.
-	ChunkQuerier(ctx context.Context, mint, maxt int64) (ChunkQuerier, Warnings, error)
+	ChunkQuerier(ctx context.Context, mint, maxt int64) (ChunkQuerier, error)
 }
 
 // ChunkQuerier provides querying access over time series data of a fixed time range.
@@ -204,13 +207,6 @@ type SampleIteratable interface {
 type ChunkIteratable interface {
 	// ChunkIterator returns a new iterator that iterates over non-overlapping chunks of the series.
 	Iterator() chunks.Iterator
-}
-
-// TODO(bwplotka): Remove in next Pr.
-type DeprecatedChunkSeriesSet interface {
-	Next() bool
-	At() (labels.Labels, []chunks.Meta, tombstones.Intervals)
-	Err() error
 }
 
 type Warnings []error

@@ -16,6 +16,7 @@ package storage
 import (
 	"container/heap"
 	"context"
+	"math"
 	"reflect"
 	"sort"
 	"strings"
@@ -92,6 +93,32 @@ func (f *fanout) Querier(ctx context.Context, mint, maxt int64) (Querier, error)
 	}
 
 	return NewMergeQuerier(primaryQuerier, queriers, ChainedSeriesMerge), nil
+}
+
+func (f *fanout) ChunkQuerier(ctx context.Context, mint, maxt int64) (ChunkQuerier, error) {
+	queriers := make([]ChunkQuerier, 0, 1+len(f.secondaries))
+
+	// Add primary querier.
+	primaryQuerier, err := f.primary.ChunkQuerier(ctx, mint, maxt)
+	if err != nil {
+		return nil, err
+	}
+	queriers = append(queriers, primaryQuerier)
+
+	// Add secondary queriers.
+	for _, storage := range f.secondaries {
+		querier, err := storage.ChunkQuerier(ctx, mint, maxt)
+		if err != nil {
+			for _, q := range queriers {
+				// TODO(bwplotka): Log error.
+				_ = q.Close()
+			}
+			return nil, err
+		}
+		queriers = append(queriers, querier)
+	}
+
+	return NewMergeChunkQuerier(primaryQuerier, queriers, NewVerticalChunkSeriesMerger(MergeOverlappingChunksVertically)), nil
 }
 
 func (f *fanout) Appender() Appender {
@@ -572,7 +599,6 @@ func (h *genericSeriesSetHeap) Pop() interface{} {
 // ChainedSeriesMerge returns single series from many same series by chaining samples together.
 // In case of the timestamp overlap, the first overlapped sample is kept and the rest samples with the same timestamps
 // are dropped. We expect the same labels for each given series.
-// TODO(bwplotka): This has the same logic as tsdb.verticalChainedSeries. Remove this in favor of ChainedSeriesMerge in next PRs.
 func ChainedSeriesMerge(s ...Series) Series {
 	if len(s) == 0 {
 		return nil
@@ -708,6 +734,132 @@ type verticalChunkSeriesMerger struct {
 
 	labels labels.Labels
 	series []ChunkSeries
+}
+
+// MergeOverlappingChunksVertically merges multiple time overlapping chunks together into one bigger chunk.
+// TODO(bwplotka): https://github.com/prometheus/tsdb/issues/670
+func MergeOverlappingChunksVertically(chks ...chunks.Meta) chunks.Iterator {
+	chk := chunkenc.NewXORChunk()
+	app, err := chk.Appender()
+	if err != nil {
+		return errChunksIterator{err: err}
+	}
+	seriesIter := newVerticalMergeSeriesIterator(chks...)
+
+	mint := int64(math.MaxInt64)
+	maxt := int64(math.MinInt64)
+
+	for seriesIter.Next() {
+		t, v := seriesIter.At()
+		app.Append(t, v)
+
+		maxt = t
+		if mint == math.MaxInt64 {
+			mint = t
+		}
+	}
+	if err := seriesIter.Err(); err != nil {
+		return errChunksIterator{err: err}
+	}
+
+	return NewListChunkSeriesIterator(chunks.Meta{
+		MinTime: mint,
+		MaxTime: maxt,
+		Chunk:   chk,
+	})
+}
+
+type errChunksIterator struct {
+	err error
+}
+
+func (e errChunksIterator) At() chunks.Meta { return chunks.Meta{} }
+func (e errChunksIterator) Next() bool      { return false }
+func (e errChunksIterator) Err() error      { return e.err }
+
+// verticalMergeSeriesIterator implements a series iterator over a list
+// of time-sorted, time-overlapping iterators.
+type verticalMergeSeriesIterator struct {
+	a, b                  chunkenc.Iterator
+	aok, bok, initialized bool
+
+	curT int64
+	curV float64
+}
+
+func newVerticalMergeSeriesIterator(s ...chunks.Meta) chunkenc.Iterator {
+	if len(s) == 1 {
+		return s[0].Chunk.Iterator(nil)
+	}
+
+	if len(s) == 2 {
+		return &verticalMergeSeriesIterator{
+			a:    s[0].Chunk.Iterator(nil),
+			b:    s[1].Chunk.Iterator(nil),
+			curT: math.MinInt64,
+		}
+	}
+
+	return &verticalMergeSeriesIterator{
+		a:    s[0].Chunk.Iterator(nil),
+		b:    newVerticalMergeSeriesIterator(s[1:]...),
+		curT: math.MinInt64,
+	}
+}
+
+func (it *verticalMergeSeriesIterator) Seek(t int64) bool {
+	it.aok, it.bok = it.a.Seek(t), it.b.Seek(t)
+	it.initialized = true
+	return it.Next()
+}
+
+func (it *verticalMergeSeriesIterator) Next() bool {
+	if !it.initialized {
+		it.aok = it.a.Next()
+		it.bok = it.b.Next()
+		it.initialized = true
+	}
+
+	if !it.aok && !it.bok {
+		return false
+	}
+
+	if !it.aok {
+		it.curT, it.curV = it.b.At()
+		it.bok = it.b.Next()
+		return true
+	}
+	if !it.bok {
+		it.curT, it.curV = it.a.At()
+		it.aok = it.a.Next()
+		return true
+	}
+
+	acurT, acurV := it.a.At()
+	bcurT, bcurV := it.b.At()
+	if acurT < bcurT {
+		it.curT, it.curV = acurT, acurV
+		it.aok = it.a.Next()
+	} else if acurT > bcurT {
+		it.curT, it.curV = bcurT, bcurV
+		it.bok = it.b.Next()
+	} else {
+		it.curT, it.curV = bcurT, bcurV
+		it.aok = it.a.Next()
+		it.bok = it.b.Next()
+	}
+	return true
+}
+
+func (it *verticalMergeSeriesIterator) At() (t int64, v float64) {
+	return it.curT, it.curV
+}
+
+func (it *verticalMergeSeriesIterator) Err() error {
+	if it.a.Err() != nil {
+		return it.a.Err()
+	}
+	return it.b.Err()
 }
 
 // NewVerticalChunkSeriesMerger returns VerticalChunkSeriesMerger that merges the same chunk series into one or more chunks.
