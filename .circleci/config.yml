@@ -5,6 +5,8 @@ orbs:
   prometheus: prometheus/prometheus@0.4.0
   go: circleci/go@0.2.0
   win: circleci/windows@2.3.0
+  lsif-node: sourcegraph/lsif-node@0.1.0
+  lsif-upload: sourcegraph/lsif-upload@0.1.0
 
 executors:
   # Whenever the Go version is updated here, .promu.yml
@@ -18,6 +20,11 @@ executors:
       - image: fuzzitdev/golang:1.12.7-buster
 
 jobs:
+  index:
+    steps:
+      - lsif-node/build-index
+      - lsif-upload/upload
+
   test:
     executor: golang
 
